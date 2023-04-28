@@ -117,6 +117,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.vocab_size = config.vocab_size
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -159,6 +160,27 @@ class GPT(nn.Module):
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
+        
+        self.set_context_mask()
+
+    def set_context_mask(self, context=5, device=None):
+        # Convert the list of indices to a numpy array
+        res = torch.sqrt(torch.tensor(self.vocab_size)).long()
+        context = torch.tensor(context)
+        idx_arr = torch.tensor(range(0, res*res))
+
+        # Initialize a 100x100xN matrix with all entries set to 0, where N is the length of idx_arr
+        context_mask = torch.zeros((len(idx_arr), res, res))
+
+        # Calculate row and column indices for the elements corresponding to the indices in idx_arr
+        row_indices = idx_arr // res
+        col_indices = idx_arr % res
+
+        # Set the value of the elements at the indices in idx_arr and surrounding 3x3 elements to 1 using numpy broadcasting
+        for i in range(len(context_mask)):
+            context_mask[i, torch.maximum(torch.tensor(0), row_indices[i]-context//2):torch.minimum(row_indices[i]+context//2+1, res),
+                            torch.maximum(torch.tensor(0), col_indices[i]-context//2):torch.minimum(col_indices[i]+context//2+1, res)] = 1
+        self.register_buffer('context_mask', context_mask.flatten(1, 2))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -289,6 +311,9 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            # implement context mask to enforce local consistency
+            idx_last = idx_cond[:, -1]
+            masks = self.context_mask[idx_last]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
@@ -298,7 +323,8 @@ class GPT(nn.Module):
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            assert logits.shape == masks.shape
+            probs = F.softmax(logits, dim=-1)*masks
             # either sample from the distribution or take the most likely element
             if do_sample:
                 idx_next = torch.multinomial(probs, num_samples=1)
